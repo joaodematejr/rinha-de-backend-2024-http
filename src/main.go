@@ -1,88 +1,143 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"github.com/gorilla/mux"
 	"log"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/gorilla/mux"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-type TransactionRequest struct {
-	Valor     int    `json:"valor"`
-	Tipo      string `json:"tipo"`
-	Descricao string `json:"descricao"`
+// Cliente representa a estrutura de um cliente
+type Cliente struct {
+	ID     int     `json:"id" bson:"_id"`
+	Limite int     `json:"limite" bson:"limit"`
+	Saldo  float64 `json:"saldo" bson:"balance"`
 }
 
-type TransactionResponse struct {
-	Limite int `json:"limite"`
-	Saldo  int `json:"saldo"`
-}
-
-type Transaction struct {
+// Transacao representa a estrutura de uma transação
+type Transacao struct {
 	Valor       int       `json:"valor"`
 	Tipo        string    `json:"tipo"`
 	Descricao   string    `json:"descricao"`
 	RealizadaEm time.Time `json:"realizada_em"`
 }
 
-type StatementResponse struct {
-	Saldo             Balance       `json:"saldo"`
-	UltimasTransacoes []Transaction `json:"ultimas_transacoes"`
+// Configuração do MongoDB
+var mongoURI = "mongodb://admin:admin@localhost:27017"
+var dbName = "rinha"
+var collectionName = "clientes"
+
+// Conexão com o MongoDB
+var client *mongo.Client
+
+// Inicializa a conexão com o MongoDB
+func init() {
+	// Conectar ao MongoDB
+	clientOptions := options.Client().ApplyURI(mongoURI)
+	var err error
+	client, err = mongo.Connect(context.Background(), clientOptions)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Verificar conexão
+	err = client.Ping(context.Background(), nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("Conexão com o MongoDB estabelecida com sucesso")
+
+	// Criar o índice único para evitar IDs duplicados
+	indexModel := mongo.IndexModel{
+		Keys:    bson.M{"_id": 10},
+		Options: options.Index().SetUnique(true),
+	}
+	_, err = client.Database(dbName).Collection(collectionName).Indexes().CreateOne(context.Background(), indexModel)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
-type Balance struct {
-	Total       int       `json:"total"`
-	DataExtrato time.Time `json:"data_extrato"`
-	Limite      int       `json:"limite"`
-	Saldo       int       `json:"saldo"`
-}
+// CriarTransacao cria uma nova transação para um cliente
+func CriarTransacao(w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	clienteID := params["id"]
 
-var clients = map[int]Balance{
-	1: {100000, time.Now(), 0, 0},
-	2: {80000, time.Now(), 0, 0},
-	3: {1000000, time.Now(), 0, 0},
-	4: {10000000, time.Now(), 0, 0},
-	5: {500000, time.Now(), 0, 0},
-}
-
-func TransactionHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id := vars["id"]
-	idInt, err := strconv.Atoi(id)
-	var req TransactionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	var cliente Cliente
+	err := client.Database(dbName).Collection(collectionName).FindOne(context.Background(), bson.M{"_id": clienteID}).Decode(&cliente)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
+	var transacao Transacao
+	err = json.NewDecoder(r.Body).Decode(&transacao)
 	if err != nil {
-
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
-	res := TransactionResponse{clients[idInt].Limite, clients[idInt].Saldo}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
+	if transacao.Tipo == "d" && float64(transacao.Valor) > cliente.Saldo+float64(cliente.Limite) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		return
+	}
+
+	if transacao.Tipo == "c" {
+		cliente.Saldo += float64(transacao.Valor)
+	} else {
+		cliente.Saldo -= float64(transacao.Valor)
+	}
+
+	transacao.RealizadaEm = time.Now()
+	clienteIDInt := parseInt(clienteID)
+	_, err = client.Database(dbName).Collection(collectionName).UpdateOne(context.Background(), bson.M{"_id": clienteIDInt}, bson.M{"$push": bson.M{"transacoes": transacao}, "$set": bson.M{"saldo": cliente.Saldo}})
+	if err != nil {
+		log.Fatal(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(cliente)
 }
 
-func StatementHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id := vars["id"]
-	idInt, err := strconv.Atoi(id)
-	if err != nil {
+// ObterExtrato retorna o extrato de transações de um cliente
+func ObterExtrato(w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	clienteID := params["id"]
 
+	var cliente Cliente
+	err := client.Database(dbName).Collection(collectionName).FindOne(context.Background(), bson.M{"_id": clienteID}).Decode(&cliente)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
 
-	res := TransactionResponse{clients[idInt].Limite, clients[idInt].Saldo}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(cliente)
+}
+
+// Função auxiliar para converter uma string em int
+func parseInt(str string) int {
+	val, err := strconv.Atoi(str)
+	if err != nil {
+		return 0
+	}
+	return val
 }
 
 func main() {
-	r := mux.NewRouter()
-	r.HandleFunc("/clientes/{id}/transacoes", TransactionHandler).Methods("POST")
-	r.HandleFunc("/clientes/{id}/extrato", StatementHandler).Methods("GET")
+	router := mux.NewRouter()
 
-	log.Fatal(http.ListenAndServe(":8080", r))
+	router.HandleFunc("/clientes/{id}/transacoes", CriarTransacao).Methods("POST")
+	router.HandleFunc("/clientes/{id}/extrato", ObterExtrato).Methods("GET")
+
+	log.Fatal(http.ListenAndServe(":8080", router))
 }
