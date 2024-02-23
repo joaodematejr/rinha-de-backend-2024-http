@@ -12,9 +12,9 @@ db.createUser({
 db.createCollection("clientes");
 
 db.clientes.insertMany([
-  { _id: 1, limit: 100000, balance: 0 },
-  { _id: 2, limit: 80000, balance: 0 },
-  { _id: 3, limit: 1000000, balance: 0 },
-  { _id: 4, limit: 10000000, balance: 0 },
-  { _id: 5, limit: 500000, balance: 0 },
+  { id: 1, limite: 100000, saldo_inicial: 0 },
+  { id: 2, limite: 80000, saldo_inicial: 0 },
+  { id: 3, limite: 1000000, saldo_inicial: 0 },
+  { id: 4, limite: 10000000, saldo_inicial: 0 },
+  { id: 5, limite: 500000, saldo_inicial: 0 },
 ]);

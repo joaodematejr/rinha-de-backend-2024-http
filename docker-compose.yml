@@ -1,25 +1,29 @@
-version: "3.7"
+version: "3.5"
 
 services:
   db:
     image: mongo:latest
-    container_name: rinha_container_mongo
+    restart: always
+    hostname: db
+    container_name: db
     environment:
       - MONGO_INITDB_DATABASE=rinha
       - MONGO_INITDB_ROOT_USERNAME=admin
       - MONGO_INITDB_ROOT_PASSWORD=admin
+      - MONGO_PORT=27017
     ports:
-    - "27017:27017"
+      - "27017:27017"
+    networks:
+      - rinha-nginx-2024q1
     volumes:
       - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
-    networks:
-      - rinha_network
     deploy:
       resources:
         limits:
           cpus: "1.0"
-          memory: "330MB"
+          memory: "475MB"
+
 networks:
-  rinha_network:
-    name: rinha_network
+  rinha-nginx-2024q1:
+    name: rinha-nginx-2024q1
     driver: bridge
