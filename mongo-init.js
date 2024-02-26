@@ -18,3 +18,4 @@ db.clientes.insertMany([
   { id: 4, limite: 10000000, saldo_inicial: 0 },
   { id: 5, limite: 500000, saldo_inicial: 0 },
 ]);
+

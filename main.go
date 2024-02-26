@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -36,27 +38,40 @@ type RespostaTransacao struct {
 }
 
 type Saldo struct {
-	Total       int    `json:"total"`
-	DataExtrato string `json:"data_extrato"`
-	Limite      int    `json:"limite"`
+	Total       int       `json:"total"`
+	DataExtrato time.Time `json:"data_extrato"`
+	Limite      int       `json:"limite"`
 }
 
 var dbClient *mongo.Client
-
+var clienteMutex sync.Mutex
 var ErrClienteNaoEncontrado = errors.New("Cliente não encontrado")
+
+func connectToMongoDB(uri string) (*mongo.Client, error) {
+	clientOptions := options.Client().ApplyURI(uri)
+	clientOptions = clientOptions.SetConnectTimeout(10 * time.Second)
+	var client *mongo.Client
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		client, err = mongo.Connect(context.Background(), clientOptions)
+		if err == nil {
+			return client, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return nil, err
+}
 
 func main() {
 	fmt.Println("Iniciando servidor...")
 	r := mux.NewRouter()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	var err error
-	dbClient, err = mongo.Connect(ctx, options.Client().ApplyURI("mongodb://admin:admin@localhost:27017"))
+	dbClient, err = connectToMongoDB("mongodb://admin:admin@localhost:27017")
 	if err != nil {
 		log.Fatalf("Erro ao conectar ao banco de dados: %v\n", err)
 	}
-	defer dbClient.Disconnect(ctx)
+	defer dbClient.Disconnect(context.Background())
 
 	r.HandleFunc("/clientes/{id}/transacoes", criarTransacao).Methods("POST")
 	r.HandleFunc("/clientes/{id}/extrato", getExtrato).Methods("GET")
@@ -83,27 +98,48 @@ func criarTransacao(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if transacao.Valor <= 0 {
-		http.Error(w, "O valor da transação deve ser um número inteiro positivo", http.StatusBadRequest)
+		http.Error(w, "O valor da transação deve ser um número inteiro positivo", http.StatusUnprocessableEntity)
 		return
 	}
 
 	if transacao.Tipo != "c" && transacao.Tipo != "d" {
-		http.Error(w, "O tipo da transação deve ser 'c' para crédito ou 'd' para débito", http.StatusBadRequest)
+		http.Error(w, "O tipo da transação deve ser 'c' para crédito ou 'd' para débito", http.StatusUnprocessableEntity)
 		return
 	}
 
 	if len(transacao.Descricao) < 1 || len(transacao.Descricao) > 10 {
-		http.Error(w, "A descrição da transação deve ter entre 1 e 10 caracteres", http.StatusBadRequest)
+		http.Error(w, "A descrição da transação deve ter entre 1 e 10 caracteres", http.StatusUnprocessableEntity)
 		return
 	}
 
-	resposta, err := realizarTransacao(clienteID, transacao)
+	cliente, err := buscarCliente(clienteID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		if strings.Contains(err.Error(), "não encontrado") {
+			http.Error(w, "Cliente não encontrado", http.StatusUnprocessableEntity)
+		} else {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		}
 		return
 	}
 
-	json.NewEncoder(w).Encode(resposta)
+	respostaCh := make(chan *RespostaTransacao)
+	errCh := make(chan error)
+
+	go func() {
+		resposta, err := realizarTransacao(cliente, transacao)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respostaCh <- resposta
+	}()
+
+	select {
+	case resposta := <-respostaCh:
+		json.NewEncoder(w).Encode(resposta)
+	case err := <-errCh:
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+	}
 }
 
 func getExtrato(w http.ResponseWriter, r *http.Request) {
@@ -116,20 +152,43 @@ func getExtrato(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cliente, err := buscarCliente(clienteID)
-	if err != nil {
-		if err == ErrClienteNaoEncontrado {
-			http.Error(w, "Cliente não encontrado", http.StatusNotFound)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-		return
-	}
+	clienteCh := make(chan *Cliente)
+	transacoesCh := make(chan []Transacao)
+	errCh := make(chan error)
 
-	transacoes, err := getUltimasTransacoes(clienteID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	go func() {
+		cliente, err := buscarCliente(clienteID)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		clienteCh <- cliente
+	}()
+
+	go func() {
+		transacoes, err := getUltimasTransacoes(clienteID)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		transacoesCh <- transacoes
+	}()
+
+	var cliente *Cliente
+	var transacoes []Transacao
+	for i := 0; i < 2; i++ {
+		select {
+		case cliente = <-clienteCh:
+		case trans := <-transacoesCh:
+			transacoes = trans
+		case err := <-errCh:
+			if strings.Contains(err.Error(), "não encontrado") {
+				http.Error(w, "Cliente não encontrado", http.StatusNotFound)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
 	}
 
 	resposta := struct {
@@ -138,7 +197,7 @@ func getExtrato(w http.ResponseWriter, r *http.Request) {
 	}{
 		Saldo: Saldo{
 			Total:       cliente.Saldo,
-			DataExtrato: time.Now().UTC().Format("2006-01-02T15:04:05.999Z"),
+			DataExtrato: time.Now(),
 			Limite:      cliente.Limite,
 		},
 		UltimasTransacoes: transacoes,
@@ -155,38 +214,64 @@ func buscarCliente(id int) (*Cliente, error) {
 	}
 
 	collection := dbClient.Database("rinha").Collection("clientes")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	errCh := make(chan error)
+
 	var cliente Cliente
-	err := collection.FindOne(ctx, bson.M{"id": id}).Decode(&cliente)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return nil, ErrClienteNaoEncontrado
+	go func() {
+		err := collection.FindOne(ctx, bson.M{"id": id}).Decode(&cliente)
+		if err != nil {
+			if err == mongo.ErrNoDocuments {
+				errCh <- fmt.Errorf("Cliente com o ID %d não encontrado", id)
+			} else {
+				errCh <- err
+			}
+			return
 		}
-		return nil, err
+		errCh <- nil
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return nil, err
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
+
 	return &cliente, nil
 }
 
-func realizarTransacao(id int, transacao Transacao) (*RespostaTransacao, error) {
-	cliente, err := buscarCliente(id)
-	if err != nil {
-		return nil, err
+func realizarTransacao(cliente *Cliente, transacao Transacao) (*RespostaTransacao, error) {
+	if dbClient == nil {
+		return nil, errors.New("Cliente MongoDB não inicializado")
 	}
 
-	if transacao.Valor < (-1 * cliente.Limite) {
-		return nil, errors.New("Transação de débito deixaria o saldo inconsistente")
-	}
+	clienteMutex.Lock()
+	defer clienteMutex.Unlock()
 
-	cliente.Saldo = transacao.Valor
+	var novoSaldo int
+	switch transacao.Tipo {
+	case "d":
+		novoSaldo = cliente.Saldo - transacao.Valor
+		if novoSaldo < -cliente.Limite {
+			return nil, errors.New("Transação de débito deixaria o saldo abaixo do limite negativo")
+		}
+	case "c":
+		novoSaldo = cliente.Saldo + transacao.Valor
+	default:
+		return nil, errors.New("Tipo de transação inválido")
+	}
 
 	collection := dbClient.Database("rinha").Collection("clientes")
-	filter := bson.M{"id": id}
-	update := bson.M{"$set": bson.M{"saldo_inicial": cliente.Saldo}}
-	_, err = collection.UpdateOne(context.Background(), filter, update)
+	filter := bson.M{"id": cliente.ID}
+	update := bson.M{"$set": bson.M{"saldo_inicial": novoSaldo}}
+	_, err := collection.UpdateOne(context.Background(), filter, update)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Erro ao atualizar saldo do cliente: %v", err)
 	}
 
 	novaTransacao := Transacao{
@@ -194,46 +279,73 @@ func realizarTransacao(id int, transacao Transacao) (*RespostaTransacao, error) 
 		Tipo:        transacao.Tipo,
 		Descricao:   transacao.Descricao,
 		RealizadaEm: time.Now(),
-		ClienteID:   id,
+		ClienteID:   cliente.ID,
 	}
-
 	collectionHistorico := dbClient.Database("rinha").Collection("historico_transacoes")
 	_, err = collectionHistorico.InsertOne(context.Background(), novaTransacao)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Erro ao registrar transação no histórico: %v", err)
 	}
 
-	resposta := &RespostaTransacao{
+	return &RespostaTransacao{
 		Limite: cliente.Limite,
-		Saldo:  cliente.Saldo,
-	}
-
-	return resposta, nil
+		Saldo:  novoSaldo,
+	}, nil
 }
 
 func getUltimasTransacoes(id int) ([]Transacao, error) {
+	if dbClient == nil {
+		return nil, errors.New("Cliente MongoDB não inicializado")
+	}
+
 	collection := dbClient.Database("rinha").Collection("historico_transacoes")
 	filtro := bson.M{"clienteid": id}
-	opcoes := options.Find().SetSort(bson.D{{"realizada_em", -1}}).SetLimit(10)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	opcoes := options.Find().SetSort(bson.D{{Key: "realizada_em", Value: -1}}).SetLimit(10)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cursor, err := collection.Find(ctx, filtro, opcoes)
-	if err != nil {
-		return nil, err
-	}
-	defer cursor.Close(ctx)
+	semaphore := make(chan struct{}, 5)
+	defer close(semaphore)
 
-	var transacoes []Transacao
-	for cursor.Next(ctx) {
-		var transacao Transacao
-		if err := cursor.Decode(&transacao); err != nil {
-			return nil, err
+	resultChan := make(chan []Transacao)
+	errChan := make(chan error)
+
+	go func() {
+		semaphore <- struct{}{}
+		defer func() { <-semaphore }()
+
+		cursor, err := collection.Find(ctx, filtro, opcoes)
+		if err != nil {
+			errChan <- err
+			return
 		}
-		transacoes = append(transacoes, transacao)
-	}
-	if err := cursor.Err(); err != nil {
+		defer cursor.Close(ctx)
+
+		var transacoes []Transacao
+		for cursor.Next(ctx) {
+			var transacao Transacao
+			if err := cursor.Decode(&transacao); err != nil {
+				errChan <- err
+				return
+			}
+			transacoes = append(transacoes, transacao)
+		}
+
+		if err := cursor.Err(); err != nil {
+			errChan <- err
+			return
+		}
+
+		resultChan <- transacoes
+	}()
+
+	select {
+	case transacoes := <-resultChan:
+		return transacoes, nil
+	case err := <-errChan:
 		return nil, err
+	case <-ctx.Done():
+		<-semaphore
+		return nil, ctx.Err()
 	}
-	return transacoes, nil
 }

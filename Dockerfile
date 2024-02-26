@@ -21,4 +21,8 @@ COPY --from=builder /app/main .
 
 EXPOSE 8080
 
+ENV TZ=America/Sao_Paulo
+
+RUN apk add --no-cache tzdata
+
 CMD ["./main"]
