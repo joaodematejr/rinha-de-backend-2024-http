@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -43,41 +46,26 @@ type Saldo struct {
 	Limite      int       `json:"limite"`
 }
 
-var dbClient *mongo.Client
-var clienteMutex sync.Mutex
-var ErrClienteNaoEncontrado = errors.New("Cliente não encontrado")
+var (
+	dbClient     *mongo.Client
+	clienteMutex sync.Mutex
+	errNotFound  = errors.New("Cliente não encontrado")
+)
 
-func connectToMongoDB(uri string) (*mongo.Client, error) {
+func connectToMongoDB(uri string) error {
 	clientOptions := options.Client().ApplyURI(uri)
 	clientOptions = clientOptions.SetConnectTimeout(10 * time.Second)
-	var client *mongo.Client
 	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		client, err = mongo.Connect(context.Background(), clientOptions)
-		if err == nil {
-			return client, nil
-		}
-		time.Sleep(2 * time.Second)
-	}
-	return nil, err
+	dbClient, err = mongo.Connect(context.Background(), clientOptions)
+	return err
 }
 
-func main() {
-	fmt.Println("Iniciando servidor...")
-	r := mux.NewRouter()
-
-	var err error
-	dbClient, err = connectToMongoDB("mongodb://admin:admin@localhost:27017")
-	if err != nil {
-		log.Fatalf("Erro ao conectar ao banco de dados: %v\n", err)
+func getPort() string {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-	defer dbClient.Disconnect(context.Background())
-
-	r.HandleFunc("/clientes/{id}/transacoes", criarTransacao).Methods("POST")
-	r.HandleFunc("/clientes/{id}/extrato", getExtrato).Methods("GET")
-
-	fmt.Println("Servidor rodando na porta 8080...")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	return port
 }
 
 func criarTransacao(w http.ResponseWriter, r *http.Request) {
@@ -214,32 +202,18 @@ func buscarCliente(id int) (*Cliente, error) {
 	}
 
 	collection := dbClient.Database("rinha").Collection("clientes")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	errCh := make(chan error)
-
 	var cliente Cliente
-	go func() {
-		err := collection.FindOne(ctx, bson.M{"id": id}).Decode(&cliente)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				errCh <- fmt.Errorf("Cliente com o ID %d não encontrado", id)
-			} else {
-				errCh <- err
-			}
-			return
+	err := collection.FindOne(ctx, bson.M{"id": id}).Decode(&cliente)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, errNotFound
+		} else if strings.Contains(err.Error(), "Premature close") {
+			return nil, errors.New("Conexão fechada prematuramente ao buscar cliente")
 		}
-		errCh <- nil
-	}()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return nil, err
-		}
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, err
 	}
 
 	return &cliente, nil
@@ -297,11 +271,10 @@ func getUltimasTransacoes(id int) ([]Transacao, error) {
 	if dbClient == nil {
 		return nil, errors.New("Cliente MongoDB não inicializado")
 	}
-
 	collection := dbClient.Database("rinha").Collection("historico_transacoes")
 	filtro := bson.M{"clienteid": id}
-	opcoes := options.Find().SetSort(bson.D{{Key: "realizada_em", Value: -1}}).SetLimit(10)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	opcoes := options.Find().SetSort(bson.D{{Key: "realizadaem", Value: -1}}).SetLimit(10)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	semaphore := make(chan struct{}, 5)
@@ -343,9 +316,61 @@ func getUltimasTransacoes(id int) ([]Transacao, error) {
 	case transacoes := <-resultChan:
 		return transacoes, nil
 	case err := <-errChan:
+		if strings.Contains(err.Error(), "Premature close") {
+			return nil, errors.New("Conexão fechada prematuramente ao buscar transações")
+		}
+		log.Printf("Erro ao buscar as últimas transações: %v\n", err)
 		return nil, err
 	case <-ctx.Done():
 		<-semaphore
+		log.Println("Tempo limite excedido ao buscar as últimas transações")
 		return nil, ctx.Err()
 	}
+}
+
+func main() {
+	fmt.Println("Iniciando servidor...")
+	r := mux.NewRouter()
+
+	dbErrCh := make(chan error, 1)
+	go func() {
+		dbErrCh <- connectToMongoDB("mongodb://admin:admin@db:27017")
+	}()
+
+	r.HandleFunc("/clientes/{id}/transacoes", criarTransacao).Methods("POST")
+	r.HandleFunc("/clientes/{id}/extrato", getExtrato).Methods("GET")
+
+	server := &http.Server{
+		Addr:    ":" + getPort(),
+		Handler: r,
+	}
+
+	httpErrCh := make(chan error, 1)
+	go func() {
+		httpErrCh <- server.ListenAndServe()
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+
+	fmt.Println("Desligando servidor...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Erro ao desligar o servidor: %v\n", err)
+	}
+
+	select {
+	case err := <-dbErrCh:
+		if err != nil {
+			log.Fatalf("Erro ao conectar ao banco de dados: %v\n", err)
+		}
+	case err := <-httpErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Erro no servidor: %v\n", err)
+		}
+	}
+
+	fmt.Println("Servidor desligado")
 }
