@@ -32,7 +32,6 @@ type Transacao struct {
 	Tipo        string    `json:"tipo"`
 	Descricao   string    `json:"descricao"`
 	RealizadaEm time.Time `json:"realizada_em"`
-	ClienteID   int       `json:"cliente_id"`
 }
 
 type RespostaTransacao struct {
@@ -260,25 +259,26 @@ func realizarTransacao(cliente *Cliente, transacao Transacao) (*RespostaTransaca
 		return nil, errors.New("Tipo de transação inválido")
 	}
 
-	collection := dbClient.Database("rinha").Collection("clientes")
-	filter := bson.M{"id": cliente.ID}
-	update := bson.M{"$set": bson.M{"saldo_inicial": novoSaldo}}
-	_, err := collection.UpdateOne(context.Background(), filter, update)
-	if err != nil {
-		return nil, fmt.Errorf("Erro ao atualizar saldo do cliente: %v", err)
-	}
-
 	novaTransacao := Transacao{
 		Valor:       transacao.Valor,
 		Tipo:        transacao.Tipo,
 		Descricao:   transacao.Descricao,
 		RealizadaEm: time.Now(),
-		ClienteID:   cliente.ID,
 	}
-	collectionHistorico := dbClient.Database("rinha").Collection("historico_transacoes")
-	_, err = collectionHistorico.InsertOne(context.Background(), novaTransacao)
+
+	collection := dbClient.Database("rinha").Collection("clientes")
+	filter := bson.M{"id": cliente.ID}
+	update := bson.M{
+		"$set": bson.M{
+			"saldo_inicial": novoSaldo,
+		},
+		"$push": bson.M{
+			"historico_transacoes": novaTransacao,
+		},
+	}
+	_, err := collection.UpdateOne(context.Background(), filter, update)
 	if err != nil {
-		return nil, fmt.Errorf("Erro ao registrar transação no histórico: %v", err)
+		return nil, fmt.Errorf("Erro ao atualizar saldo do cliente: %v", err)
 	}
 
 	return &RespostaTransacao{
@@ -291,61 +291,31 @@ func getUltimasTransacoes(id int) ([]Transacao, error) {
 	if dbClient == nil {
 		return nil, errors.New("Cliente MongoDB não inicializado")
 	}
-	collection := dbClient.Database("rinha").Collection("historico_transacoes")
-	filtro := bson.M{"clienteid": id}
-	opcoes := options.Find().SetSort(bson.D{{Key: "realizadaem", Value: -1}}).SetLimit(10)
+
+	// Definir a coleção e o filtro para encontrar o cliente pelo ID
+	collection := dbClient.Database("rinha").Collection("clientes")
+	filtro := bson.M{"id": id}
+
+	// Definir opções para a consulta, ordenando por data/hora em ordem decrescente e limitando a 10 transações
+	opcoes := options.FindOne().SetSort(bson.D{{Key: "historico_transacoes.realizadaem", Value: -1}}).SetProjection(bson.M{"historico_transacoes": bson.M{"$slice": -10}})
+
+	// Realizar a consulta
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	semaphore := make(chan struct{}, 5)
-	defer close(semaphore)
-
-	resultChan := make(chan []Transacao)
-	errChan := make(chan error)
-
-	go func() {
-		semaphore <- struct{}{}
-		defer func() { <-semaphore }()
-
-		cursor, err := collection.Find(ctx, filtro, opcoes)
-		if err != nil {
-			errChan <- err
-			return
-		}
-		defer cursor.Close(ctx)
-
-		var transacoes []Transacao
-		for cursor.Next(ctx) {
-			var transacao Transacao
-			if err := cursor.Decode(&transacao); err != nil {
-				errChan <- err
-				return
-			}
-			transacoes = append(transacoes, transacao)
-		}
-
-		if err := cursor.Err(); err != nil {
-			errChan <- err
-			return
-		}
-
-		resultChan <- transacoes
-	}()
-
-	select {
-	case transacoes := <-resultChan:
-		return transacoes, nil
-	case err := <-errChan:
-		if strings.Contains(err.Error(), "Premature close") {
-			return nil, errors.New("Conexão fechada prematuramente ao buscar transações")
-		}
-		log.Printf("Erro ao buscar as últimas transações: %v\n", err)
-		return nil, err
-	case <-ctx.Done():
-		<-semaphore
-		log.Println("Tempo limite excedido ao buscar as últimas transações")
-		return nil, ctx.Err()
+	// Estrutura para armazenar o resultado da consulta
+	var cliente struct {
+		HistoricoTransacoes []Transacao `bson:"historico_transacoes"`
 	}
+
+	// Realizar a consulta e decodificar o resultado para a estrutura 'cliente'
+	err := collection.FindOne(ctx, filtro, opcoes).Decode(&cliente)
+	if err != nil {
+		return nil, fmt.Errorf("Erro ao buscar o cliente: %v", err)
+	}
+
+	// Retornar o histórico de transações do cliente
+	return cliente.HistoricoTransacoes, nil
 }
 
 func main() {
