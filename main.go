@@ -52,12 +52,32 @@ var (
 	errNotFound  = errors.New("Cliente não encontrado")
 )
 
-func connectToMongoDB(uri string) error {
-	clientOptions := options.Client().ApplyURI(uri)
-	clientOptions = clientOptions.SetConnectTimeout(10 * time.Second)
-	var err error
-	dbClient, err = mongo.Connect(context.Background(), clientOptions)
-	return err
+func connectToMongoDB(uri string, errCh chan<- error) {
+	clientOptions := options.Client().
+		SetTimeout(time.Second * 6).
+		SetMaxPoolSize(350).
+		SetMinPoolSize(150).
+		ApplyURI(uri).
+		SetConnectTimeout(10 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, clientOptions)
+	if err != nil {
+		errCh <- fmt.Errorf("failed to connect to MongoDB: %w", err)
+		return
+	}
+
+	// Ensure the connection is established by pinging the MongoDB server
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		errCh <- fmt.Errorf("failed to ping MongoDB server: %w", err)
+		return
+	}
+
+	// Set the global dbClient variable
+	dbClient = client
 }
 
 func getPort() string {
@@ -332,14 +352,17 @@ func main() {
 	fmt.Println("Iniciando servidor...")
 	r := mux.NewRouter()
 
+	// Connect to MongoDB
 	dbErrCh := make(chan error, 1)
-	go func() {
-		dbErrCh <- connectToMongoDB("mongodb://admin:admin@db:27017/rinha?socketTimeoutMS=360000&connectTimeoutMS=360000&maxPoolSize=10&minPoolSize=5&waitQueueMultiple=10&waitQueueTimeoutMS=360000&readPreference=primary&writeConcern=majority&readConcern=majority")
-	}()
 
+	// Connect to MongoDB concurrently
+	go connectToMongoDB("mongodb://admin:admin@db:27017/rinha?socketTimeoutMS=360000&connectTimeoutMS=360000&maxPoolSize=10&minPoolSize=5&waitQueueMultiple=10&waitQueueTimeoutMS=360000&readPreference=primary&writeConcern=majority&readConcern=majority", dbErrCh)
+
+	// Define HTTP routes
 	r.HandleFunc("/clientes/{id}/transacoes", criarTransacao).Methods("POST")
 	r.HandleFunc("/clientes/{id}/extrato", getExtrato).Methods("GET")
 
+	// Start HTTP server
 	server := &http.Server{
 		Addr:    ":" + getPort(),
 		Handler: r,
@@ -350,6 +373,7 @@ func main() {
 		httpErrCh <- server.ListenAndServe()
 	}()
 
+	// Graceful Shutdown Handling
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
