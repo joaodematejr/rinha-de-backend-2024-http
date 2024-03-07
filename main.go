@@ -334,7 +334,7 @@ func main() {
 
 	dbErrCh := make(chan error, 1)
 	go func() {
-		dbErrCh <- connectToMongoDB("mongodb://admin:admin@db:27017")
+		dbErrCh <- connectToMongoDB("mongodb://admin:admin@db:27017/rinha?socketTimeoutMS=360000&connectTimeoutMS=360000&maxPoolSize=10&minPoolSize=5&waitQueueMultiple=10&waitQueueTimeoutMS=360000&readPreference=primary&writeConcern=majority&readConcern=majority")
 	}()
 
 	r.HandleFunc("/clientes/{id}/transacoes", criarTransacao).Methods("POST")

@@ -34,9 +34,14 @@ services:
     container_name: api02
     environment:
       - MUX_HOST=api02
-      - MONGO_URL=mongodb://admin:admin@db:27017
+      - MONGO_URL=mongodb://admin:admin@db:27017/rinha?socketTimeoutMS=360000&connectTimeoutMS=360000&maxPoolSize=10&minPoolSize=5&waitQueueMultiple=10&waitQueueTimeoutMS=360000&readPreference=primary&writeConcern=majority&readConcern=majority      
     ports:
       - "8082:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: "45MB"
 
   nginx:
    image: nginx:1.25.3-alpine
@@ -51,11 +56,11 @@ services:
    deploy:
      resources:
        limits:
-        cpus: "0.17"
-        memory: "6MB"
+        cpus: '0.25'
+        memory: "35MB"
 
   db:
-    image: mongo:latest
+    image: mongo:7-jammy
     restart: always
     hostname: db
     container_name: db
@@ -70,14 +75,19 @@ services:
       - MONGO_MAX_CONNECTIONS=500
     ports:
       - "27017:27017"
-    command: mongod --setParameter=maxIndexBuildMemoryUsageMegabytes=100
     volumes:
       - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
     deploy:
       resources:
         limits:
-          cpus: "0.75"
-          memory: "529MB"
+          cpus: '0.75'
+          memory: '425MB'
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh db:27017/test --quiet
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
 
 networks:
   rinha-nginx-2024q1:
